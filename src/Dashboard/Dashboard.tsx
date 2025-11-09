@@ -9,11 +9,18 @@ interface Story {
   developerExperience: string;
   teamSequence: string;
   [key: string]: any;
+  // new fields for parsed estimates from backend
+  estimated_hours?: number | null;
+  confidence?: string | null;
+  raw?: string | null;
+  // keep legacy `estimate` for backward-compat if needed (optional)
   estimate?: string;
 }
 
 const EffortEstimator: React.FC = () => {
   const [stories, setStories] = useState<Story[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -30,7 +37,7 @@ const EffortEstimator: React.FC = () => {
         id: index + 1,
         title: row["Title"] || "",
         description: row["Description"] || "",
-        developerExperience: row["Developer Experience"] || "",
+        developerExperience: row["Developer Experience"] || "Mid",
         teamSequence: row["Team Sequence"] || "",
       }));
       setStories(parsedStories);
@@ -49,23 +56,76 @@ const EffortEstimator: React.FC = () => {
   };
 
   const handleSubmit = async () => {
+    setError(null);
+    if (stories.length === 0) {
+      setError("No stories to estimate.");
+      return;
+    }
+
+    setLoading(true);
     try {
-      const response = await fetch("http://localhost:5000/api/estimate", {
+      const response = await fetch("http://localhost:3001/api/v1/estimate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ stories: stories }),
       });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Server error: ${response.status} - ${text}`);
+      }
+
       const data = await response.json();
 
-      // backend should return array of estimates in same order
-      setStories((prev) =>
-        prev.map((row, idx) => ({
-          ...row,
-          estimate: data.estimates[idx] || "N/A",
-        }))
-      );
-    } catch (err) {
+      // Expecting data.estimates to be an array of objects like:
+      // { id, title, estimated_hours, confidence, raw }
+      const estimatesArr: any[] = Array.isArray(data?.estimates)
+        ? data.estimates
+        : [];
+
+      // Build a map by id for quick lookup
+      const estimatesMap = new Map<number | string, any>();
+      for (const e of estimatesArr) {
+        if (e && e.id !== undefined) {
+          estimatesMap.set(Number(e.id), e);
+          estimatesMap.set(String(e.id), e);
+        }
+      }
+
+      // Align and update stories by id (not by index)
+      const updated = stories.map((s) => {
+        const found =
+          estimatesMap.get(s.id) ?? estimatesMap.get(String(s.id)) ?? null;
+        if (found) {
+          return {
+            ...s,
+            estimated_hours:
+              found.estimated_hours !== undefined
+                ? Number(found.estimated_hours)
+                : null,
+            confidence: found.confidence ?? null,
+            raw: found.raw ?? null,
+            // optional backward-compatible field:
+            estimate:
+              found.estimated_hours !== undefined
+                ? String(found.estimated_hours)
+                : s.estimate,
+          };
+        }
+        return {
+          ...s,
+          estimated_hours: null,
+          confidence: null,
+          raw: null,
+        };
+      });
+
+      setStories(updated);
+    } catch (err: any) {
       console.error("Error fetching estimates", err);
+      setError(err?.message ?? "Unknown error occurred");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -75,6 +135,9 @@ const EffortEstimator: React.FC = () => {
       <div className="uploadSection">
         <input type="file" accept=".xlsx,.csv" onChange={handleFileUpload} />
       </div>
+
+      {error && <div className="errorBox">{error}</div>}
+
       {stories.length > 0 && (
         <div>
           <table className="tableContainer">
@@ -85,7 +148,7 @@ const EffortEstimator: React.FC = () => {
                 <th>Description</th>
                 <th>Developer Experience</th>
                 <th>Team Sequence</th>
-                <th>Effort Estimate</th>
+                <th>Effort Estimate (hrs)</th>
               </tr>
             </thead>
             <tbody>
@@ -133,13 +196,19 @@ const EffortEstimator: React.FC = () => {
                       placeholder="e.g., BA -> Integration -> Dev -> QA"
                     />
                   </td>
-                  <td>{story.estimate || "-"}</td>
+
+                  {/* render primitive estimated value - avoids React object error */}
+                  <td>
+                    {story.estimated_hours !== undefined && story.estimated_hours !== null
+                      ? story.estimated_hours
+                      : "-"}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <button onClick={handleSubmit} className="submit-btn">
-            Submit for Estimation
+          <button onClick={handleSubmit} className="submit-btn" disabled={loading}>
+            {loading ? "Estimating..." : "Submit for Estimation"}
           </button>
         </div>
       )}
