@@ -3,7 +3,9 @@ import * as XLSX from "xlsx";
 import "./Dashboard.scss";
 
 interface Story {
-  id: number;
+  // id is now a string (may be index-based string or DB UUID returned by backend)
+  id: string;
+  external_id?: string | null;
   title: string;
   description: string;
   developerExperience: string;
@@ -33,13 +35,25 @@ const EffortEstimator: React.FC = () => {
       const sheetName = workbook.SheetNames[0];
       const worksheet = workbook.Sheets[sheetName];
       const jsonData: any[] = XLSX.utils.sheet_to_json(worksheet);
-      const parsedStories: Story[] = jsonData.map((row, index) => ({
-        id: index + 1,
-        title: row["Title"] || "",
-        description: row["Description"] || "",
-        developerExperience: row["Developer Experience"] || "Mid",
-        teamSequence: row["Team Sequence"] || "",
-      }));
+
+      // parse rows; use strings for id and external_id (if Excel has an ID column)
+      const parsedStories: Story[] = jsonData.map((row, index) => {
+        const extId =
+          row["ID"] ??
+          row["Id"] ??
+          row["External ID"] ??
+          row["external_id"] ??
+          null;
+        return {
+          id: extId ? String(extId) : String(index + 1), // keep a stable string id if no external id
+          external_id: extId ? String(extId) : null,
+          title: row["Title"] || "",
+          description: row["Description"] || "",
+          developerExperience: row["Developer Experience"] || "Mid",
+          teamSequence: row["Team Sequence"] || "",
+        };
+      });
+
       setStories(parsedStories);
     };
     reader.readAsArrayBuffer(file);
@@ -64,10 +78,20 @@ const EffortEstimator: React.FC = () => {
 
     setLoading(true);
     try {
+      // Prepare payload (send external_id if present so server can map)
+      const payloadStories = stories.map((s) => ({
+        id: s.id,
+        external_id: s.external_id ?? null,
+        title: s.title,
+        description: s.description,
+        developer_experience: s.developerExperience,
+        team_sequence: s.teamSequence,
+      }));
+
       const response = await fetch("http://localhost:3001/api/v1/estimate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stories: stories }),
+        body: JSON.stringify({ stories: payloadStories }),
       });
 
       if (!response.ok) {
@@ -77,50 +101,120 @@ const EffortEstimator: React.FC = () => {
 
       const data = await response.json();
 
-      // Expecting data.estimates to be an array of objects like:
-      // { id, title, estimated_hours, confidence, raw }
-      const estimatesArr: any[] = Array.isArray(data?.estimates)
-        ? data.estimates
-        : [];
+      // If backend returns { stories: [...], estimates: [...] }, handle that shape:
+      if (
+        data &&
+        Array.isArray(data.stories) &&
+        Array.isArray(data.estimates)
+      ) {
+        const serverStories: any[] = data.stories;
+        const serverEstimates: any[] = data.estimates;
 
-      // Build a map by id for quick lookup
-      const estimatesMap = new Map<number | string, any>();
-      for (const e of estimatesArr) {
-        if (e && e.id !== undefined) {
-          estimatesMap.set(Number(e.id), e);
-          estimatesMap.set(String(e.id), e);
+        // Map server stories by external_id and by id
+        const byExternal = new Map<string, any>();
+        const byId = new Map<string, any>();
+        for (const ss of serverStories) {
+          if (ss.external_id != null)
+            byExternal.set(String(ss.external_id), ss);
+          if (ss.id != null) byId.set(String(ss.id), ss);
         }
-      }
 
-      // Align and update stories by id (not by index)
-      const updated = stories.map((s) => {
-        const found =
-          estimatesMap.get(s.id) ?? estimatesMap.get(String(s.id)) ?? null;
-        if (found) {
+        // Map estimates by story_id
+        const estimateByStoryId = new Map<string, any>();
+        for (const est of serverEstimates) {
+          if (est.story_id != null)
+            estimateByStoryId.set(String(est.story_id), est);
+        }
+
+        // Build updated stories
+        const updated = stories.map((s) => {
+          // Try matching: external_id -> serverStory -> estimate
+          let matchedServerStory = null;
+          if (s.external_id)
+            matchedServerStory = byExternal.get(String(s.external_id));
+          // fallback: try matching by title (case-insensitive)
+          if (!matchedServerStory) {
+            matchedServerStory = serverStories.find(
+              (ss) =>
+                ss.title &&
+                s.title &&
+                ss.title.trim().toLowerCase() === s.title.trim().toLowerCase()
+            );
+          }
+          // final fallback: try to match by original frontend id (if server returned it)
+          if (!matchedServerStory) {
+            matchedServerStory = byId.get(String(s.id));
+          }
+
+          let est = null;
+          if (matchedServerStory && matchedServerStory.id) {
+            est = estimateByStoryId.get(String(matchedServerStory.id)) ?? null;
+          }
+
+          if (est) {
+            return {
+              ...s,
+              estimated_hours:
+                est.estimated_hours !== undefined &&
+                est.estimated_hours !== null
+                  ? Number(est.estimated_hours)
+                  : null,
+              confidence: est.confidence ?? null,
+              raw: est.raw ?? null,
+              estimate:
+                est.estimated_hours !== undefined &&
+                est.estimated_hours !== null
+                  ? String(est.estimated_hours)
+                  : s.estimate,
+            };
+          }
+
+          // No matching estimate — set nulls
           return {
             ...s,
-            estimated_hours:
-              found.estimated_hours !== undefined
-                ? Number(found.estimated_hours)
-                : null,
-            confidence: found.confidence ?? null,
-            raw: found.raw ?? null,
-            // optional backward-compatible field:
-            estimate:
-              found.estimated_hours !== undefined
-                ? String(found.estimated_hours)
-                : s.estimate,
+            estimated_hours: null,
+            confidence: null,
+            raw: null,
           };
-        }
-        return {
-          ...s,
-          estimated_hours: null,
-          confidence: null,
-          raw: null,
-        };
-      });
+        });
 
-      setStories(updated);
+        setStories(updated);
+      } else {
+        // old behavior: data may have an array of estimates directly
+        const estimatesArr: any[] = Array.isArray(data?.estimates)
+          ? data.estimates
+          : [];
+        const estimatesMap = new Map<string, any>();
+        for (const e of estimatesArr) {
+          if (e && e.id !== undefined && e.id !== null) {
+            estimatesMap.set(String(e.id), e);
+          } else if (e && e.story_id !== undefined && e.story_id !== null) {
+            estimatesMap.set(String(e.story_id), e);
+          }
+        }
+
+        const updated = stories.map((s) => {
+          const found =
+            estimatesMap.get(String(s.external_id)) ??
+            estimatesMap.get(String(s.id));
+          if (found) {
+            const hours =
+              found.estimated_hours != null
+                ? Number(found.estimated_hours)
+                : null;
+            return {
+              ...s,
+              estimated_hours: hours,
+              confidence: found.confidence ?? null,
+              raw: found.raw ?? null,
+              estimate: hours !== null ? String(hours) : s.estimate,
+            };
+          }
+          return { ...s, estimated_hours: null, confidence: null, raw: null };
+        });
+
+        setStories(updated);
+      }
     } catch (err: any) {
       console.error("Error fetching estimates", err);
       setError(err?.message ?? "Unknown error occurred");
@@ -133,7 +227,12 @@ const EffortEstimator: React.FC = () => {
     <div className="mainContainer">
       <h1 className="title">AI-Powered Agile Effort Estimation</h1>
       <div className="uploadSection">
-        <input type="file" accept=".xlsx,.csv" onChange={handleFileUpload} />
+        <input
+          type="file"
+          accept=".xlsx,.csv"
+          onChange={handleFileUpload}
+          className="uploadBtn"
+        />
       </div>
 
       {error && <div className="errorBox">{error}</div>}
@@ -143,7 +242,7 @@ const EffortEstimator: React.FC = () => {
           <table className="tableContainer">
             <thead>
               <tr>
-                <th>ID</th>
+                <th>Sr No</th>
                 <th>Title</th>
                 <th>Description</th>
                 <th>Developer Experience</th>
@@ -154,7 +253,7 @@ const EffortEstimator: React.FC = () => {
             <tbody>
               {stories.map((story, index) => (
                 <tr key={story.id}>
-                  <td>{story.id}</td>
+                  <td>{index + 1}</td>
                   <td>
                     <input
                       value={story.title}
@@ -199,7 +298,8 @@ const EffortEstimator: React.FC = () => {
 
                   {/* render primitive estimated value - avoids React object error */}
                   <td>
-                    {story.estimated_hours !== undefined && story.estimated_hours !== null
+                    {story.estimated_hours !== undefined &&
+                    story.estimated_hours !== null
                       ? story.estimated_hours
                       : "-"}
                   </td>
@@ -207,7 +307,11 @@ const EffortEstimator: React.FC = () => {
               ))}
             </tbody>
           </table>
-          <button onClick={handleSubmit} className="submit-btn" disabled={loading}>
+          <button
+            onClick={handleSubmit}
+            className="submit-btn"
+            disabled={loading}
+          >
             {loading ? "Estimating..." : "Submit for Estimation"}
           </button>
         </div>

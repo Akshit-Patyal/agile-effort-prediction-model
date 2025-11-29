@@ -95,3 +95,13 @@
   font-style: italic;
   padding: 2rem 0;
 }
+
+input, select{
+  border: 1px solid;
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+.uploadBtn {
+  border: none;
+}
